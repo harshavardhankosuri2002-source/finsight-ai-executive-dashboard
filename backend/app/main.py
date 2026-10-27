@@ -33,7 +33,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Health endpoint
+# Health endpoint (support both /api/health and /health)
+@app.get("/health")
 @app.get("/api/health")
 def health_check(db: Session = Depends(get_db)):
     record_count = db.query(MonthlyRecord).count()
@@ -47,15 +48,20 @@ def health_check(db: Session = Depends(get_db)):
         "version": "1.0.0"
     }
 
-# Register API Routers
-app.include_router(dashboard.router, prefix=settings.API_V1_STR)
-app.include_router(kpis.router, prefix=settings.API_V1_STR)
-app.include_router(analysis.router, prefix=settings.API_V1_STR)
-app.include_router(risks.router, prefix=settings.API_V1_STR)
-app.include_router(assistant.router, prefix=settings.API_V1_STR)
-app.include_router(scenarios.router, prefix=settings.API_V1_STR)
-app.include_router(data.router, prefix=settings.API_V1_STR)
-app.include_router(reports.router, prefix=settings.API_V1_STR)
+# Register API Routers (registering under /api prefix and direct for serverless rewrite compatibility)
+all_routers = [
+    dashboard.router,
+    kpis.router,
+    analysis.router,
+    risks.router,
+    assistant.router,
+    scenarios.router,
+    data.router,
+    reports.router
+]
+for r in all_routers:
+    app.include_router(r, prefix=settings.API_V1_STR)
+    app.include_router(r)
 
 if __name__ == "__main__":
     import uvicorn
