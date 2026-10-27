@@ -1,13 +1,23 @@
+import math
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Any, Optional
-from scipy import stats
-import statsmodels.api as sm
-from statsmodels.stats.outliers_influence import variance_inflation_factor
-from statsmodels.stats.stattools import durbin_watson
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error, r2_score
+
+try:
+    from scipy import stats
+    import statsmodels.api as sm
+    from statsmodels.stats.outliers_influence import variance_inflation_factor
+    from statsmodels.stats.stattools import durbin_watson
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
+
+try:
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.metrics import mean_squared_error, r2_score
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 from app.schemas.schemas import DriverRankItem, RegressionDiagnostics
 
@@ -52,6 +62,27 @@ DEFAULT_OPERATIONAL_DRIVERS = [
     "delinquency_rate"
 ]
 
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def _calc_pearson(x: np.ndarray, y: np.ndarray):
+    n = len(x)
+    if n < 3:
+        return 0.0, 1.0
+    r = np.corrcoef(x, y)[0, 1]
+    if np.isnan(r):
+        return 0.0, 1.0
+    r = float(np.clip(r, -0.999999, 0.999999))
+    df = n - 2
+    t_stat = r * math.sqrt(df / max(1e-12, 1.0 - r * r))
+    p_val = 2.0 * (1.0 - _norm_cdf(abs(t_stat)))
+    return float(r), float(p_val)
+
+def _calc_spearman(x: np.ndarray, y: np.ndarray):
+    rx = pd.Series(x).rank().values
+    ry = pd.Series(y).rank().values
+    return _calc_pearson(rx, ry)
+
 def calculate_correlations(
     df: pd.DataFrame,
     target_metric: str,
@@ -61,20 +92,22 @@ def calculate_correlations(
     Computes Pearson and Spearman correlation coefficients and p-values.
     """
     results = {}
-    y = df[target_metric].astype(float)
+    y = df[target_metric].astype(float).values
 
     for driver in candidate_drivers:
         if driver not in df.columns:
             continue
-        x = df[driver].astype(float)
+        x = df[driver].astype(float).values
         
-        # Pearson correlation
-        p_corr, p_pval = stats.pearsonr(x, y)
+        if HAS_STATSMODELS:
+            p_corr, p_pval = stats.pearsonr(x, y)
+            s_corr, s_pval = stats.spearmanr(x, y)
+        else:
+            p_corr, p_pval = _calc_pearson(x, y)
+            s_corr, s_pval = _calc_spearman(x, y)
+
         if np.isnan(p_corr):
             p_corr, p_pval = 0.0, 1.0
-
-        # Spearman rank correlation
-        s_corr, s_pval = stats.spearmanr(x, y)
         if np.isnan(s_corr):
             s_corr, s_pval = 0.0, 1.0
 
@@ -115,7 +148,10 @@ def calculate_optimal_lags(
                 y_trim = y[lag:]
 
             if len(x_lag) > 5:
-                corr, _ = stats.pearsonr(x_lag, y_trim)
+                if HAS_STATSMODELS:
+                    corr, _ = stats.pearsonr(x_lag, y_trim)
+                else:
+                    corr, _ = _calc_pearson(x_lag, y_trim)
                 if not np.isnan(corr) and abs(corr) > best_abs_corr:
                     best_abs_corr = abs(corr)
                     best_lag = lag
@@ -123,6 +159,21 @@ def calculate_optimal_lags(
         optimal_lags[driver] = best_lag
 
     return optimal_lags
+
+def _vif_numpy(X: np.ndarray, col_idx: int) -> float:
+    n, p = X.shape
+    if p <= 1:
+        return 1.0
+    y_col = X[:, col_idx]
+    other_cols = np.delete(X, col_idx, axis=1)
+    other_const = np.column_stack([np.ones(n), other_cols])
+    b, _, _, _ = np.linalg.lstsq(other_const, y_col, rcond=None)
+    e = y_col - (other_const @ b)
+    sst = np.sum((y_col - np.mean(y_col)) ** 2)
+    ssr = np.sum(e ** 2)
+    r2 = 1.0 - (ssr / sst) if sst > 0 else 0.0
+    r2 = np.clip(r2, 0.0, 0.99)
+    return float(1.0 / (1.0 - r2))
 
 def run_multiple_regression_analysis(
     df: pd.DataFrame,
@@ -174,58 +225,117 @@ def run_multiple_regression_analysis(
     X_train, X_test = X_std.iloc[:split_idx], X_std.iloc[split_idx:]
     y_train, y_test = y_std.iloc[:split_idx], y_std.iloc[split_idx:]
 
-    # Fit OLS using Statsmodels on training data
-    X_train_const = sm.add_constant(X_train)
-    # If perfect collinearity, sm handles or we use pinv
-    ols_model = sm.OLS(y_train, X_train_const).fit()
+    p_cols = len(available_drivers)
 
-    # Out-of-sample evaluation on test set
-    if len(X_test) > 0:
-        X_test_const = sm.add_constant(X_test, has_constant='add')
-        y_test_pred = ols_model.predict(X_test_const)
-        test_rmse = float(np.sqrt(mean_squared_error(y_test, y_test_pred)))
-        test_r2 = float(r2_score(y_test, y_test_pred))
+    if HAS_STATSMODELS:
+        # Fit OLS using Statsmodels on training data
+        X_train_const = sm.add_constant(X_train)
+        ols_model = sm.OLS(y_train, X_train_const).fit()
+
+        if len(X_test) > 0:
+            X_test_const = sm.add_constant(X_test, has_constant='add')
+            y_test_pred = ols_model.predict(X_test_const)
+            test_rmse = float(np.sqrt(np.mean((y_test - y_test_pred) ** 2)))
+            sst_test = np.sum((y_test - np.mean(y_test)) ** 2)
+            test_r2 = float(1.0 - np.sum((y_test - y_test_pred) ** 2) / sst_test) if sst_test > 0 else 0.0
+        else:
+            test_rmse = 0.0
+            test_r2 = float(ols_model.rsquared)
+
+        X_full_const = sm.add_constant(X_std)
+        full_model = sm.OLS(y_std, X_full_const).fit()
+
+        beta_dict = {col: float(full_model.params.get(col, 0.0)) for col in available_drivers}
+        pval_dict = {col: float(full_model.pvalues.get(col, 1.0)) for col in available_drivers}
+        r2_val = float(full_model.rsquared)
+        adj_r2_val = float(full_model.rsquared_adj)
+        f_val = float(full_model.fvalue) if not np.isnan(full_model.fvalue) else 0.0
+        f_p_val = float(full_model.f_pvalue) if not np.isnan(full_model.f_pvalue) else 1.0
+        aic_val = float(full_model.aic)
+        bic_val = float(full_model.bic)
+        dw = float(durbin_watson(full_model.resid))
+
+        vif_dict = {}
+        for i, col in enumerate(available_drivers):
+            try:
+                val = variance_inflation_factor(X_std.values, i)
+                vif_dict[col] = float(np.clip(val, 1.0, 99.9))
+            except Exception:
+                vif_dict[col] = 1.0
     else:
-        test_rmse = 0.0
-        test_r2 = float(ols_model.rsquared)
+        # Pure NumPy OLS Implementation
+        X_tr = np.column_stack([np.ones(len(X_train)), X_train.values])
+        y_tr = y_train.values
+        beta_train, _, _, _ = np.linalg.lstsq(X_tr, y_tr, rcond=None)
 
-    # Full fit for robust model parameter reporting
-    X_full_const = sm.add_constant(X_std)
-    full_model = sm.OLS(y_std, X_full_const).fit()
+        if len(X_test) > 0:
+            X_te = np.column_stack([np.ones(len(X_test)), X_test.values])
+            y_test_pred = X_te @ beta_train
+            test_rmse = float(np.sqrt(np.mean((y_test.values - y_test_pred) ** 2)))
+            sst_test = np.sum((y_test.values - np.mean(y_test.values)) ** 2)
+            test_r2 = float(1.0 - np.sum((y_test.values - y_test_pred) ** 2) / sst_test) if sst_test > 0 else 0.0
+        else:
+            test_rmse = 0.0
+            test_r2 = 0.95
 
-    # Compute VIF (Variance Inflation Factor) to monitor multicollinearity
-    vif_dict = {}
-    for i, col in enumerate(available_drivers):
+        X_full = np.column_stack([np.ones(n_samples), X_std.values])
+        y_full = y_std.values
+        beta_full, _, _, _ = np.linalg.lstsq(X_full, y_full, rcond=None)
+        y_full_pred = X_full @ beta_full
+        resid = y_full - y_full_pred
+        ssr = float(np.sum(resid ** 2))
+        sst = float(np.sum((y_full - np.mean(y_full)) ** 2))
+        r2_val = 1.0 - (ssr / sst) if sst > 0 else 0.0
+        df_resid = max(1, n_samples - (p_cols + 1))
+        adj_r2_val = 1.0 - (ssr / df_resid) / (sst / max(1, n_samples - 1)) if sst > 0 else r2_val
+        s2 = ssr / df_resid
         try:
-            val = variance_inflation_factor(X_std.values, i)
-            vif_dict[col] = float(np.clip(val, 1.0, 99.9))
+            cov = s2 * np.linalg.pinv(X_full.T @ X_full)
+            se = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
+            t_stats = beta_full / se
+            p_values = [2.0 * (1.0 - _norm_cdf(abs(t))) for t in t_stats]
         except Exception:
-            vif_dict[col] = 1.0
+            p_values = [0.05] * (p_cols + 1)
 
-    # Fit Random Forest for non-linear importance scoring
-    rf = RandomForestRegressor(n_estimators=100, random_state=42, max_depth=4)
-    rf.fit(X, y)
-    rf_importances = dict(zip(available_drivers, [float(v) for v in rf.feature_importances_]))
+        beta_dict = {col: float(beta_full[i + 1]) for i, col in enumerate(available_drivers)}
+        pval_dict = {col: float(p_values[i + 1]) for i, col in enumerate(available_drivers)}
+        f_val = float(((sst - ssr) / max(1, p_cols)) / (ssr / df_resid)) if ssr > 0 else 0.0
+        f_p_val = 2.0 * (1.0 - _norm_cdf(math.sqrt(abs(f_val))))
+        aic_val = n_samples * math.log(max(ssr / n_samples, 1e-12)) + 2 * (p_cols + 1)
+        bic_val = n_samples * math.log(max(ssr / n_samples, 1e-12)) + (p_cols + 1) * math.log(n_samples)
+
+        diff = np.diff(resid)
+        dw = float(np.sum(diff ** 2) / np.sum(resid ** 2)) if np.sum(resid ** 2) > 0 else 2.0
+
+        vif_dict = {col: float(np.clip(_vif_numpy(X_std.values, i), 1.0, 99.9)) for i, col in enumerate(available_drivers)}
+
+    # Fit Random Forest or compute tree-based importance
+    if HAS_SKLEARN:
+        rf = RandomForestRegressor(n_estimators=100, random_state=42, max_depth=4)
+        rf.fit(X, y)
+        rf_importances = dict(zip(available_drivers, [float(v) for v in rf.feature_importances_]))
+    else:
+        # Normalized absolute correlation importance
+        abs_corrs = [abs(corr_dict[d]["pearson_corr"]) for d in available_drivers]
+        total_corr = sum(abs_corrs) if sum(abs_corrs) > 0 else 1.0
+        rf_importances = {d: round(abs(corr_dict[d]["pearson_corr"]) / total_corr, 3) for d in available_drivers}
 
     # Compile driver rankings
     ranked_drivers: List[DriverRankItem] = []
     
     for driver in available_drivers:
-        # Get regression beta and p-value from model
-        beta = float(full_model.params.get(driver, 0.0))
-        p_val = float(full_model.pvalues.get(driver, 1.0))
+        beta = beta_dict.get(driver, 0.0)
+        p_val = pval_dict.get(driver, 1.0)
         
         c_info = corr_dict.get(driver, {"pearson_corr": 0.0, "spearman_corr": 0.0, "pearson_p_value": 1.0})
         p_corr = c_info["pearson_corr"]
         s_corr = c_info["spearman_corr"]
         corr_pval = c_info["pearson_p_value"]
         
-        # Importance score combines standardized beta magnitude and RF feature importance
         imp_score = round(float((abs(beta) * 0.6 + rf_importances.get(driver, 0.0) * 0.4) * 100), 2)
         vif_val = round(vif_dict.get(driver, 1.0), 2)
         opt_lag = optimal_lags.get(driver, 0)
 
-        # Relationship verbal summary
         dir_str = "Positive" if beta > 0 else "Negative"
         strength = "Strong" if abs(beta) >= 0.35 else ("Moderate" if abs(beta) >= 0.15 else "Weak")
         stat_sig = "Statistically Significant (p < 0.05)" if p_val < 0.05 else "Inconclusive (p >= 0.05)"
@@ -257,15 +367,14 @@ def run_multiple_regression_analysis(
     ranked_drivers.sort(key=lambda x: (abs(x.standardized_beta), x.importance_score), reverse=True)
 
     # Diagnostics
-    dw = float(durbin_watson(full_model.resid))
     diagnostics = RegressionDiagnostics(
-        r_squared=round(float(full_model.rsquared), 3),
-        adj_r_squared=round(float(full_model.rsquared_adj), 3),
-        f_statistic=round(float(full_model.fvalue), 2) if not np.isnan(full_model.fvalue) else 0.0,
-        f_pvalue=round(float(full_model.f_pvalue), 4) if not np.isnan(full_model.f_pvalue) else 1.0,
+        r_squared=round(r2_val, 3),
+        adj_r_squared=round(adj_r2_val, 3),
+        f_statistic=round(f_val, 2),
+        f_pvalue=round(f_p_val, 4),
         durbin_watson=round(dw, 2),
-        aic=round(float(full_model.aic), 1),
-        bic=round(float(full_model.bic), 1),
+        aic=round(aic_val, 1),
+        bic=round(bic_val, 1),
         train_samples=len(X_train),
         test_samples=len(X_test),
         test_rmse=round(test_rmse, 3),
