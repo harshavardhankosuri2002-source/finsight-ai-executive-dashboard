@@ -1,0 +1,11 @@
+{
+  "name": "finsight-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FinSight AI — HDFC Bank Executive Decision Intelligence Platform",
+  "scripts": {
+    "build": "cd frontend && npm install && npm run build",
+    "dev": "cd frontend && npm run dev",
+    "test": "cd frontend && npm test"
+  }
+}
